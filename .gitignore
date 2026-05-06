@@ -1,0 +1,7 @@
+build/
+*.o
+*.a
+*.so
+*.pyc
+node_modules/
+.env
