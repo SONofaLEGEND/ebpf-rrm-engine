@@ -1,36 +1,32 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# ebpf-rrm-engine/Makefile  —  Phase 1
+# ebpf-rrm-engine/Makefile — Phase 2
 #
-# Architecture auto-detected from `uname -m`.
-# Tested on: Ubuntu 22.04, kernel 5.15+, clang 17, arm64 and x86_64.
+# Changes from Phase 1:
+#   - `make agent`  builds the Go agent binary
+#   - `make run`    builds + runs the agent (owns XDP lifecycle)
+#   - `make load` / `make unload` kept for standalone XDP testing
+#   - `make gen-*`  convenience targets for the traffic generator
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARCH := $(shell uname -m)
-
-# Map uname -m output to BPF target arch flag.
-# uname gives 'aarch64' on Apple Silicon VMs, 'x86_64' on Intel.
 ifeq ($(ARCH),aarch64)
     BPF_ARCH := arm64
 else ifeq ($(ARCH),x86_64)
     BPF_ARCH := x86
 else
-    $(error [!] Unsupported architecture: $(ARCH). Expected aarch64 or x86_64.)
+    $(error [!] Unsupported architecture: $(ARCH))
 endif
 
-# System headers for the target arch (asm/types.h etc.)
 LINUX_INC := /usr/include/$(ARCH)-linux-gnu
+CLANG     := clang
+BPFTOOL   := bpftool
+GO        := /usr/local/go/bin/go
 
-CLANG   := clang
-BPFTOOL := bpftool
+KERN_SRC  := kern/rrm_xdp.c
+KERN_OBJ  := kern/rrm_xdp.o
+AGENT_BIN := rrm-agent
+AGENT_DIR := ./agent
 
-KERN_SRC := kern/rrm_xdp.c
-KERN_OBJ := kern/rrm_xdp.o
-PIN_PATH := /sys/fs/bpf/rrm_xdp
-
-# Include order matters:
-#   1. kern/       → vmlinux.h (all kernel types), rrm_maps.h
-#   2. proto/      → capwap_lite.h (our protocol definition)
-#   3. LINUX_INC   → arch-specific system headers
 INCLUDES := -I./kern -I./proto -I$(LINUX_INC)
 
 CFLAGS := \
@@ -39,71 +35,95 @@ CFLAGS := \
     -D__TARGET_ARCH_$(BPF_ARCH) \
     $(INCLUDES)
 
-# ── Phony targets ─────────────────────────────────────────────────────────────
-.PHONY: all vmlinux load unload verify maps clean help
+.PHONY: all vmlinux agent run load unload verify maps \
+        gen-normal gen-dfs gen-spike clean help
 
-# Default: compile XDP object
-all: $(KERN_OBJ)
+# Default: compile BPF object + build Go agent
+all: $(KERN_OBJ) agent
+
+# ── BPF compilation ───────────────────────────────────────────────────────────
 
 $(KERN_OBJ): $(KERN_SRC) kern/vmlinux.h kern/rrm_maps.h proto/capwap_lite.h
-	@echo "[*] Compiling $(KERN_SRC) for BPF target (arch=$(BPF_ARCH))..."
+	@echo "[*] Compiling $(KERN_SRC) → $(KERN_OBJ) (arch=$(BPF_ARCH))"
 	$(CLANG) $(CFLAGS) -c $< -o $@
-	@echo "[+] OK: $(KERN_OBJ)"
-	@echo "[*] Sections in object:"
+	@echo "[+] BPF object compiled"
+	@echo "[*] Sections:"
 	@readelf -S $@ | grep -E 'xdp|maps|license' || true
+	@echo "[*] Verifying BTF debug info embedded:"
+	@readelf -S $@ | grep -q BTF && echo "[+] BTF present" || echo "[!] BTF missing (add -g to CFLAGS)"
 
-# Generate vmlinux.h from the running kernel's BTF.
-# Run this once, or after a kernel upgrade.
 vmlinux:
-	@echo "[*] Generating kern/vmlinux.h from /sys/kernel/btf/vmlinux ..."
+	@echo "[*] Generating kern/vmlinux.h ..."
 	@test -f /sys/kernel/btf/vmlinux || \
-	    (echo "[!] /sys/kernel/btf/vmlinux not found. Is CONFIG_DEBUG_INFO_BTF enabled?" && exit 1)
+	    (echo "[!] /sys/kernel/btf/vmlinux missing. CONFIG_DEBUG_INFO_BTF not set?" && exit 1)
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > kern/vmlinux.h
-	@echo "[+] Generated kern/vmlinux.h ($$(wc -l < kern/vmlinux.h) lines)"
+	@echo "[+] Generated ($$(wc -l < kern/vmlinux.h) lines)"
 
-# Attach XDP program to veth0 in generic mode.
-# Using bpftool instead of ip link for better compatibility with newer kernels.
+# ── Go agent ──────────────────────────────────────────────────────────────────
+
+agent: $(KERN_OBJ)
+	@echo "[*] Building Go agent..."
+	cd $(AGENT_DIR) && $(GO) mod tidy && $(GO) build -o ../$(AGENT_BIN) .
+	@echo "[+] Built: ./$(AGENT_BIN)"
+
+# Run the agent (requires root — XDP attach + BPF map access)
+# Reads BPF object from kern/rrm_xdp.o relative to project root.
+run: agent
+	@echo "[*] Starting agent on veth0 (Ctrl+C to stop)..."
+	sudo ./$(AGENT_BIN) --iface veth0
+
+# ── Standalone XDP load/unload (for testing without the Go agent) ─────────────
+
 load: $(KERN_OBJ)
-	@echo "[*] Checking for veth0..."
-	@ip link show veth0 >/dev/null 2>&1 || (echo "[!] veth0 not found. Please create it first." && exit 1)
-	@echo "[*] Loading and attaching XDP program to veth0 (xdpgeneric)..."
-	@sudo rm -f $(PIN_PATH)
-	sudo $(BPFTOOL) prog load $(KERN_OBJ) $(PIN_PATH) type xdp
-	sudo $(BPFTOOL) net attach xdpgeneric pinned $(PIN_PATH) dev veth0
-	@echo "[+] Loaded and attached. Confirm:"
-	@sudo $(BPFTOOL) net show dev veth0
-	@echo "[*] Trace output: sudo cat /sys/kernel/debug/tracing/trace_pipe"
+	@echo "[*] Attaching XDP program to veth0 (xdpgeneric)..."
+	sudo ip link set dev veth0 xdpgeneric obj $(KERN_OBJ) sec xdp
+	@echo "[+] Loaded"
+	@ip link show veth0 | grep -o 'xdp[^ ]*' || true
 
-# Detach XDP program from veth0 and cleanup.
 unload:
-	@echo "[*] Detaching XDP program from veth0..."
-	-sudo $(BPFTOOL) net detach xdpgeneric dev veth0
-	@echo "[*] Removing BPF pin..."
-	-sudo rm -f $(PIN_PATH)
+	-sudo ip link set dev veth0 xdpgeneric off
 	@echo "[+] Detached"
 
-# Show loaded programs and maps in the kernel.
+# ── Inspection ────────────────────────────────────────────────────────────────
+
 verify:
-	@echo "── BPF programs ─────────────────────────────────────────────"
+	@echo "── BPF programs ──────────────────────────────────────────────"
 	@sudo $(BPFTOOL) prog show
 	@echo ""
-	@echo "── BPF maps ─────────────────────────────────────────────────"
+	@echo "── BPF maps ──────────────────────────────────────────────────"
 	@sudo $(BPFTOOL) map show
 
-# Pretty-print BPF map contents (requires XDP program to be loaded).
 maps:
 	@sudo bash scripts/read_maps.sh
 
+# ── Traffic generator shortcuts ───────────────────────────────────────────────
+# Run these in a SEPARATE terminal while the agent is running.
+
+gen-normal:
+	sudo python3 gen/capwap_gen.py --mode normal --num-aps 5 --interval 1.0
+
+gen-dfs:
+	sudo python3 gen/capwap_gen.py --mode dfs --num-aps 5 --target-ap 2 --delay 5
+
+gen-spike:
+	sudo python3 gen/capwap_gen.py --mode spike --num-aps 5 --target-ap 3 --spike-util 92
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+
 clean:
-	@rm -f $(KERN_OBJ)
+	@rm -f $(KERN_OBJ) $(AGENT_BIN)
 	@echo "[+] Cleaned"
 
 help:
-	@echo "Targets:"
-	@echo "  make vmlinux   — generate kern/vmlinux.h (run once)"
-	@echo "  make           — compile XDP object"
-	@echo "  make load      — attach XDP to veth0"
-	@echo "  make unload    — detach XDP from veth0"
-	@echo "  make verify    — show loaded programs and maps"
-	@echo "  make maps      — pretty-print BPF map contents"
-	@echo "  make clean     — remove build artifacts"
+	@echo "Phase 2 targets:"
+	@echo "  make vmlinux      generate kern/vmlinux.h (once)"
+	@echo "  make              compile BPF + build Go agent"
+	@echo "  make run          sudo: build + run agent on veth0"
+	@echo "  make load         sudo: attach XDP via ip link (no agent)"
+	@echo "  make unload       sudo: detach XDP from veth0"
+	@echo "  make verify       show loaded BPF programs + maps"
+	@echo "  make maps         pretty-print BPF map contents"
+	@echo "  make gen-normal   run generator in normal mode"
+	@echo "  make gen-dfs      run generator in DFS mode"
+	@echo "  make gen-spike    run generator in spike mode"
+	@echo "  make clean        remove build artifacts"

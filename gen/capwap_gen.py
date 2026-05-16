@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
-gen/capwap_gen.py — Synthetic CAPWAP-lite traffic generator
+gen/capwap_gen.py — Phase 2: all three traffic modes
 
-Requires root (raw socket access for Scapy sendp).
-Run as: sudo python3 gen/capwap_gen.py [--mode normal] [--num-aps 5] [--interval 1.0]
+Modes:
+  --mode normal   steady-state telemetry (Phase 1, unchanged)
+  --mode dfs      injects a radar detection event on one AP after a delay
+  --mode spike    ramps channel_util of one AP to trigger load anomaly detection
 
-Packet structure (on the wire):
-    Ethernet / IPv4 / UDP(dport=9000) / capwap_lite_hdr (12 bytes)
+Run as: sudo python3 gen/capwap_gen.py --mode [normal|dfs|spike] [options]
 
-Sends on veth1 (10.0.0.2 → 10.0.0.1), XDP reads on veth0.
+Phase 2 milestone tests:
+  DFS:   sudo python3 gen/capwap_gen.py --mode dfs --target-ap 2 --delay 5
+         → After 5s: AP2 emits one packet with CAPWAP_EVENT_RADAR set.
+         → Go agent should print a DFS event within 1 packet interval.
+
+  Spike: sudo python3 gen/capwap_gen.py --mode spike --target-ap 3 --spike-util 92
+         → AP3 util ramps from baseline to 92% over 10 packets.
+         → Go agent should print a LOAD_ANOMALY event after 3 consecutive
+           packets above the 85% threshold.
 """
 
 import sys
@@ -18,149 +27,72 @@ import time
 import random
 import argparse
 
-# ── Root check ───────────────────────────────────────────────────────────────
 if os.geteuid() != 0:
-    print("[!] Requires root for raw socket access.", file=sys.stderr)
-    print("[!] Run: sudo python3 gen/capwap_gen.py", file=sys.stderr)
+    print("[!] Requires root. Run: sudo python3 gen/capwap_gen.py", file=sys.stderr)
     sys.exit(1)
 
-# Import Scapy after root check (avoids spurious warning output)
-from scapy.all import (
-    Ether, IP, UDP, Raw,
-    sendp, get_if_hwaddr,
-)
+from scapy.all import Ether, IP, UDP, Raw, sendp, get_if_hwaddr
 
 # ── Wire constants ────────────────────────────────────────────────────────────
-CAPWAP_LITE_PORT = 9000    # UDP destination port (matches kern/rrm_maps.h)
 
-# Interface names (must match the veth pair created in Step 0)
-SRC_IFACE = "veth1"        # Send FROM here
-DST_IFACE = "veth0"        # XDP is attached here
+CAPWAP_LITE_PORT = 9000
+SRC_IFACE        = "veth1"
+DST_IFACE        = "veth0"
+SRC_IP           = "10.0.0.2"
+DST_IP           = "10.0.0.1"
 
-SRC_IP = "10.0.0.2"       # veth1 address
-DST_IP = "10.0.0.1"       # veth0 address (where packets arrive)
+# event_flags bit definitions (must match proto/capwap_lite.h)
+CAPWAP_EVENT_NONE  = 0x00
+CAPWAP_EVENT_RADAR = 0x01
 
-# ── Channel sets ─────────────────────────────────────────────────────────────
+# Channel sets
 CHANNELS_2G = [1, 6, 11]
 CHANNELS_5G = [36, 40, 44, 48, 52, 56, 60, 64, 149, 153, 157, 161]
 
-# ── Struct packing ────────────────────────────────────────────────────────────
-#
-# Matches struct capwap_lite_hdr in proto/capwap_lite.h exactly.
-# Format string breakdown (! = network/big-endian byte order):
-#   I  = unsigned int  (4 bytes) → ap_id
-#   B  = unsigned char (1 byte)  → channel
-#   B  = unsigned char (1 byte)  → channel_util
-#   b  = signed char   (1 byte)  → noise_floor_dbm  ← signed!
-#   B  = unsigned char (1 byte)  → client_count
-#   B  = unsigned char (1 byte)  → event_flags
-#   3s = 3-byte string           → pad[3]
-# Total: 4+1+1+1+1+1+3 = 12 bytes
-#
-CAPWAP_FMT = "!IBBbBB3s"
-CAPWAP_SIZE = struct.calcsize(CAPWAP_FMT)  # should be 12
-assert CAPWAP_SIZE == 12, f"Struct size mismatch: {CAPWAP_SIZE} != 12"
+# Struct format: matches struct capwap_lite_hdr exactly
+# ! = big-endian (network byte order)
+# I  = uint32  ap_id
+# B  = uint8   channel
+# B  = uint8   channel_util
+# b  = int8    noise_floor_dbm  (SIGNED)
+# B  = uint8   client_count
+# B  = uint8   event_flags
+# 3s = 3 bytes pad[3]
+CAPWAP_FMT  = "!IBBbBB3s"
+CAPWAP_SIZE = struct.calcsize(CAPWAP_FMT)
+assert CAPWAP_SIZE == 12, f"Struct size mismatch: {CAPWAP_SIZE}"
 
 
-def build_capwap_payload(
-    ap_id: int,
-    channel: int,
-    channel_util: int,
-    noise_floor_dbm: int,
-    client_count: int,
-    event_flags: int = 0,
-) -> bytes:
-    """
-    Pack a capwap_lite_hdr payload.
-
-    Args:
-        ap_id:           AP identifier (uint32, 1–65535)
-        channel:         802.11 channel (uint8, 1–165)
-        channel_util:    utilisation percent (uint8, 0–100)
-        noise_floor_dbm: noise floor dBm (int8, -100 to 0)
-        client_count:    associated clients (uint8, 0–255)
-        event_flags:     CAPWAP_EVENT_* flags (uint8)
-
-    Returns:
-        12-byte packed bytes ready to use as UDP payload.
-    """
+def build_payload(ap_id, channel, channel_util, noise_floor_dbm,
+                  client_count, event_flags=0):
     return struct.pack(
         CAPWAP_FMT,
         ap_id,
         channel,
         channel_util,
-        noise_floor_dbm,   # signed — struct 'b' handles this correctly
+        noise_floor_dbm,
         client_count,
         event_flags,
-        b'\x00\x00\x00',  # pad[3]
+        b'\x00\x00\x00',
     )
 
 
-# ── Simulated AP ──────────────────────────────────────────────────────────────
-
-class SimulatedAP:
-    """
-    Models one AP producing periodic RF telemetry.
-
-    RF parameters drift by small random amounts each tick to simulate
-    a real environment — clients join/leave, interference appears/clears,
-    etc. All values are bounded to realistic ranges.
-    """
-
-    def __init__(self, ap_id: int, channel: int):
-        self.ap_id           = ap_id
-        self.channel         = channel
-        self.channel_util    = random.randint(20, 55)    # percent
-        self.noise_floor_dbm = random.randint(-92, -72)  # dBm, signed
-        self.client_count    = random.randint(5, 20)
-        self.event_flags     = 0x00
-
-    def tick(self) -> None:
-        """Drift RF parameters by small random amounts."""
-        # Channel utilisation: drift ±5%, clamp to [5, 90]
-        self.channel_util = max(5, min(90,
-            self.channel_util + random.randint(-5, 5)))
-
-        # Noise floor: drift ±2 dBm, clamp to [-100, -60] dBm
-        self.noise_floor_dbm = max(-100, min(-60,
-            self.noise_floor_dbm + random.randint(-2, 2)))
-
-        # Client count: drift ±2, clamp to [1, 30]
-        self.client_count = max(1, min(30,
-            self.client_count + random.randint(-2, 2)))
-
-    def payload(self) -> bytes:
-        """Build wire-format CAPWAP-lite payload for this AP's current state."""
-        return build_capwap_payload(
-            ap_id           = self.ap_id,
-            channel         = self.channel,
-            channel_util    = self.channel_util,
-            noise_floor_dbm = self.noise_floor_dbm,
-            client_count    = self.client_count,
-            event_flags     = self.event_flags,
-        )
-
-    def status_line(self) -> str:
-        return (
-            f"AP{self.ap_id:03d}: "
-            f"ch={self.channel:3d} "
-            f"util={self.channel_util:3d}% "
-            f"noise={self.noise_floor_dbm:4d}dBm "
-            f"clients={self.client_count:2d} "
-            f"flags={self.event_flags:#04x}"
-        )
+def get_macs():
+    """Resolve MAC addresses for the veth pair. Exits on failure."""
+    try:
+        src_mac = get_if_hwaddr(SRC_IFACE)
+        dst_mac = get_if_hwaddr(DST_IFACE)
+        return src_mac, dst_mac
+    except Exception as exc:
+        print(f"[!] MAC lookup failed: {exc}", file=sys.stderr)
+        print(f"[!] Ensure veth pair is up:", file=sys.stderr)
+        print(f"[!]   sudo ip link set {SRC_IFACE} up", file=sys.stderr)
+        print(f"[!]   sudo ip link set {DST_IFACE} up", file=sys.stderr)
+        sys.exit(1)
 
 
-# ── Packet builder ─────────────────────────────────────────────────────────────
-
-def build_frame(src_mac: str, dst_mac: str, sport: int, payload: bytes) -> Ether:
-    """
-    Build a complete L2 Ethernet frame carrying a CAPWAP-lite payload.
-
-    Uses sendp() (L2 send) instead of send() (L3 send) for explicit
-    control over the Ethernet header. On a directly-connected veth pair,
-    the destination MAC is known without ARP.
-    """
+def build_frame(src_mac, dst_mac, payload):
+    sport = random.randint(1024, 65535)
     return (
         Ether(src=src_mac, dst=dst_mac) /
         IP(src=SRC_IP, dst=DST_IP, ttl=64) /
@@ -169,126 +101,276 @@ def build_frame(src_mac: str, dst_mac: str, sport: int, payload: bytes) -> Ether
     )
 
 
-# ── Normal mode ────────────────────────────────────────────────────────────────
+# ── SimulatedAP ────────────────────────────────────────────────────────────────
 
-def run_normal(num_aps: int, interval: float) -> None:
-    """
-    Steady-state mode: send one telemetry packet per AP per interval.
+class SimulatedAP:
+    """Models one AP producing periodic RF telemetry with realistic drift."""
 
-    Simulates the periodic CAPWAP RF measurement reports that real APs
-    send to their WLC. RF parameters drift each tick to exercise the
-    EWMA state tracking in the XDP program (Phase 2).
+    def __init__(self, ap_id, channel):
+        self.ap_id           = ap_id
+        self.channel         = channel
+        self.channel_util    = random.randint(20, 55)
+        self.noise_floor_dbm = random.randint(-92, -72)
+        self.client_count    = random.randint(5, 20)
+        self.event_flags     = CAPWAP_EVENT_NONE
 
-    Runs indefinitely until Ctrl+C.
-    """
-    print(f"[*] Mode: normal | APs: {num_aps} | interval: {interval}s")
-    print(f"[*] {SRC_IFACE} ({SRC_IP}) → {DST_IFACE} ({DST_IP}:{CAPWAP_LITE_PORT})")
+    def tick(self):
+        self.channel_util    = max(5,    min(90,  self.channel_util + random.randint(-5, 5)))
+        self.noise_floor_dbm = max(-100, min(-60, self.noise_floor_dbm + random.randint(-2, 2)))
+        self.client_count    = max(1,    min(30,  self.client_count + random.randint(-2, 2)))
+        self.event_flags     = CAPWAP_EVENT_NONE   # cleared each tick unless overridden
 
-    # Resolve MAC addresses for veth pair.
-    # get_if_hwaddr reads from /sys/class/net/<iface>/address.
-    try:
-        src_mac = get_if_hwaddr(SRC_IFACE)
-        dst_mac = get_if_hwaddr(DST_IFACE)
-    except Exception as exc:
-        print(f"[!] Failed to get MAC addresses: {exc}", file=sys.stderr)
-        print(f"[!] Check that {SRC_IFACE} and {DST_IFACE} are UP:", file=sys.stderr)
-        print(f"[!]   ip link show {SRC_IFACE}", file=sys.stderr)
-        print(f"[!]   ip link show {DST_IFACE}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"[*] src MAC ({SRC_IFACE}): {src_mac}")
-    print(f"[*] dst MAC ({DST_IFACE}): {dst_mac}")
-
-    # Assign channels to APs, cycling through 2.4GHz and 5GHz.
-    # Real deployments interleave bands; we mirror that here.
-    all_channels = CHANNELS_2G + CHANNELS_5G
-    aps = [
-        SimulatedAP(
-            ap_id   = i + 1,
-            channel = all_channels[i % len(all_channels)]
+    def payload(self):
+        return build_payload(
+            self.ap_id, self.channel, self.channel_util,
+            self.noise_floor_dbm, self.client_count, self.event_flags,
         )
-        for i in range(num_aps)
-    ]
 
-    print("\n[*] Initial AP configuration:")
+    def status(self):
+        flags = f"RADAR" if self.event_flags & CAPWAP_EVENT_RADAR else "----"
+        return (f"AP{self.ap_id:03d}: ch={self.channel:3d} "
+                f"util={self.channel_util:3d}% "
+                f"ewma≈{self.channel_util:3d}% "
+                f"noise={self.noise_floor_dbm:4d}dBm "
+                f"clients={self.client_count:2d} [{flags}]")
+
+
+def make_aps(num_aps):
+    all_channels = CHANNELS_2G + CHANNELS_5G
+    return [SimulatedAP(i + 1, all_channels[i % len(all_channels)])
+            for i in range(num_aps)]
+
+
+# ── Mode: normal ───────────────────────────────────────────────────────────────
+
+def run_normal(num_aps, interval):
+    """Steady-state periodic telemetry for all APs. Unchanged from Phase 1."""
+    print(f"[*] Mode: normal | APs: {num_aps} | interval: {interval}s")
+    src_mac, dst_mac = get_macs()
+    aps  = make_aps(num_aps)
+    tick = 0
+
+    print("\n[*] Initial state:")
     for ap in aps:
-        print(f"    {ap.status_line()}")
-    print(f"\n[*] Sending... Ctrl+C to stop\n")
-
-    tick       = 0
-    total_pkts = 0
+        print(f"    {ap.status()}")
+    print("\n[*] Sending... Ctrl+C to stop\n")
 
     try:
         while True:
-            tick      += 1
-            tick_pkts  = 0
+            tick += 1
+            for ap in aps:
+                ap.tick()
+                sendp(build_frame(src_mac, dst_mac, ap.payload()),
+                      iface=SRC_IFACE, verbose=False)
+            if tick % 5 == 0:
+                print(f"── tick {tick:04d} ───────────────────────────────────────")
+                for ap in aps:
+                    print(f"  {ap.status()}")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"\n[*] Stopped after {tick} ticks.")
+
+
+# ── Mode: dfs ─────────────────────────────────────────────────────────────────
+
+def run_dfs(num_aps, interval, target_ap_id, delay):
+    """
+    Normal traffic for `delay` seconds, then inject a radar detection event
+    on target_ap_id. The event lasts exactly ONE packet (event_flags is
+    cleared the next tick). This mirrors real AP behaviour: the AP sends a
+    single CAPWAP radar notification, not a sustained flag.
+
+    Expected Go agent output:
+        [EVENT] DFS       AP:002 ch:6 util:43% noise:-82dBm
+    """
+    if target_ap_id < 1 or target_ap_id > num_aps:
+        print(f"[!] --target-ap must be 1–{num_aps}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] Mode: dfs | APs: {num_aps} | interval: {interval}s")
+    print(f"[*] Radar event on AP{target_ap_id:03d} in {delay}s")
+    src_mac, dst_mac = get_macs()
+    aps       = make_aps(num_aps)
+    tick      = 0
+    radar_sent = False
+    start_time = time.monotonic()
+
+    print("\n[*] Sending normal traffic... radar injection incoming\n")
+
+    try:
+        while True:
+            tick += 1
+            elapsed = time.monotonic() - start_time
 
             for ap in aps:
                 ap.tick()
 
-                sport = random.randint(1024, 65535)
-                frame = build_frame(src_mac, dst_mac, sport, ap.payload())
-                sendp(frame, iface=SRC_IFACE, verbose=False)
-                tick_pkts += 1
+                # Inject radar on target AP when delay expires (once only)
+                if (ap.ap_id == target_ap_id and
+                        elapsed >= delay and not radar_sent):
+                    ap.event_flags = CAPWAP_EVENT_RADAR
+                    print(f"\n[!] INJECTING RADAR on AP{target_ap_id:03d} "
+                          f"(tick {tick}, t={elapsed:.1f}s)")
+                    radar_sent = True
 
-            total_pkts += tick_pkts
+                sendp(build_frame(src_mac, dst_mac, ap.payload()),
+                      iface=SRC_IFACE, verbose=False)
 
-            # Print status every 5 ticks so the terminal stays readable
-            if tick % 5 == 0:
-                print(f"── tick {tick:04d} | sent {total_pkts} pkts total ─────────────")
+            if tick % 5 == 0 or (radar_sent and tick % 2 == 0):
+                print(f"── tick {tick:04d} | t={elapsed:.1f}s ──────────────")
                 for ap in aps:
-                    print(f"  {ap.status_line()}")
+                    print(f"  {ap.status()}")
+
+            # Stop 5 ticks after radar injection so output is readable
+            if radar_sent and tick > 5:
+                extra_ticks = 0
+                for _ in range(5):
+                    extra_ticks += 1
+                    tick += 1
+                    for ap in aps:
+                        ap.tick()
+                        sendp(build_frame(src_mac, dst_mac, ap.payload()),
+                              iface=SRC_IFACE, verbose=False)
+                    time.sleep(interval)
+                print(f"\n[*] DFS test complete. Check agent output for RRM_EVENT_DFS.")
+                break
 
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        print(f"\n[*] Stopped. Total: {tick} ticks, {total_pkts} packets sent.")
-        print(f"[*] Run 'make maps' to inspect BPF map state.")
+        print(f"\n[*] Stopped.")
+
+
+# ── Mode: spike ────────────────────────────────────────────────────────────────
+
+def run_spike(num_aps, interval, target_ap_id, spike_util):
+    """
+    Gradually ramps channel_util of target_ap_id from its baseline to
+    spike_util over 10 packets, then holds it there for another 5 packets.
+
+    With default thresholds (util_high=85, util_consec=3):
+    - When spike_util >= 85, the EWMA will exceed 85 after a few packets.
+    - The XDP EWMA (alpha=0.25) lags the raw value, so the consecutive
+      threshold will be crossed approximately 3–5 packets after the raw
+      util exceeds 85%.
+    - Expected: LOAD_ANOMALY event emitted by the agent.
+
+    Timeline example (baseline=40%, spike=92%, alpha=0.25):
+      Packet  Raw   EWMA (approx)   consec_high
+      1       40    40              0
+      2       55    43              0
+      3       70    47              0
+      4       85    55              0
+      5       92    63              0
+      6       92    70              0
+      7       92    76              0
+      8       92    80              0
+      9       92    84              0      ← approaching threshold
+      10      92    86              1      ← first high
+      11      92    87              2
+      12      92    88              3      ← LOAD_ANOMALY EMITTED
+    """
+    if target_ap_id < 1 or target_ap_id > num_aps:
+        print(f"[!] --target-ap must be 1–{num_aps}", file=sys.stderr)
+        sys.exit(1)
+    if spike_util < 85 or spike_util > 100:
+        print("[!] --spike-util should be >= 85 to trigger the default threshold",
+              file=sys.stderr)
+
+    print(f"[*] Mode: spike | APs: {num_aps} | interval: {interval}s")
+    print(f"[*] Ramping AP{target_ap_id:03d} util to {spike_util}% over 10 packets")
+    print(f"[*] Expected: LOAD_ANOMALY after ~3 packets above EWMA threshold\n")
+
+    src_mac, dst_mac = get_macs()
+    aps  = make_aps(num_aps)
+    tick = 0
+
+    # Find target AP and record its baseline
+    target = next(ap for ap in aps if ap.ap_id == target_ap_id)
+    baseline_util = target.channel_util
+    print(f"[*] AP{target_ap_id:03d} baseline util: {baseline_util}%")
+
+    # Ramp schedule: 10 steps from baseline to spike_util
+    ramp_steps = [
+        int(baseline_util + (spike_util - baseline_util) * i / 9)
+        for i in range(10)
+    ]
+    # Hold for 10 more packets at spike_util
+    hold_steps = [spike_util] * 10
+    schedule   = ramp_steps + hold_steps
+    sched_idx  = 0
+    ramping    = True
+
+    print(f"[*] Ramp schedule: {ramp_steps}")
+    print(f"[*] Sending... Ctrl+C to stop\n")
+
+    try:
+        while True:
+            tick += 1
+
+            for ap in aps:
+                ap.tick()
+
+                # Override target AP's util per schedule
+                if ap.ap_id == target_ap_id and sched_idx < len(schedule):
+                    ap.channel_util = schedule[sched_idx]
+
+                sendp(build_frame(src_mac, dst_mac, ap.payload()),
+                      iface=SRC_IFACE, verbose=False)
+
+            # Advance schedule on target AP
+            if sched_idx < len(schedule):
+                sched_idx += 1
+                if sched_idx == len(ramp_steps):
+                    print(f"\n[*] Ramp complete. Holding at {spike_util}% "
+                          f"for {len(hold_steps)} more packets.")
+                    ramping = False
+
+            # Print status every tick during ramp, every 3 during hold
+            if ramping or tick % 3 == 0:
+                print(f"── tick {tick:04d} ───────────────────────────────────")
+                for ap in aps:
+                    marker = " ←TARGET" if ap.ap_id == target_ap_id else ""
+                    print(f"  {ap.status()}{marker}")
+
+            # End after full schedule
+            if sched_idx >= len(schedule):
+                print(f"\n[*] Spike test complete. Check agent output for "
+                      f"RRM_EVENT_LOAD_ANOMALY.")
+                break
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print(f"\n[*] Stopped after {tick} ticks.")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description="CAPWAP-lite synthetic traffic generator — ebpf-rrm-engine",
+        description="CAPWAP-lite generator — ebpf-rrm-engine Phase 2",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--mode",
-        choices=["normal", "dfs", "spike"],
-        default="normal",
-        help="Traffic mode: normal=steady telemetry, dfs=radar event (Phase 2), spike=load anomaly (Phase 2)",
-    )
-    parser.add_argument(
-        "--num-aps",
-        type=int,
-        default=5,
-        metavar="N",
-        help="Number of simulated APs",
-    )
-    parser.add_argument(
-        "--interval",
-        type=float,
-        default=1.0,
-        metavar="SEC",
-        help="Seconds between telemetry rounds",
-    )
+    parser.add_argument("--mode", choices=["normal", "dfs", "spike"],
+                        default="normal")
+    parser.add_argument("--num-aps", type=int, default=5, metavar="N")
+    parser.add_argument("--interval", type=float, default=1.0, metavar="SEC")
+    parser.add_argument("--target-ap", type=int, default=1, metavar="AP_ID",
+                        help="AP to target for dfs/spike modes")
+    parser.add_argument("--delay", type=float, default=5.0, metavar="SEC",
+                        help="Seconds before DFS injection (dfs mode)")
+    parser.add_argument("--spike-util", type=int, default=92, metavar="PCT",
+                        help="Target utilisation percent for spike mode (85–100)")
+
     args = parser.parse_args()
 
-    if args.num_aps < 1 or args.num_aps > 512:
-        print("[!] --num-aps must be between 1 and 512", file=sys.stderr)
-        sys.exit(1)
-
-    if args.interval < 0.1:
-        print("[!] --interval must be >= 0.1 seconds", file=sys.stderr)
-        sys.exit(1)
-
     if args.mode == "normal":
-        run_normal(num_aps=args.num_aps, interval=args.interval)
-    else:
-        print(f"[!] Mode '{args.mode}' is implemented in Phase 2.", file=sys.stderr)
-        print(f"[!] Available now: --mode normal", file=sys.stderr)
-        sys.exit(1)
+        run_normal(args.num_aps, args.interval)
+    elif args.mode == "dfs":
+        run_dfs(args.num_aps, args.interval, args.target_ap, args.delay)
+    elif args.mode == "spike":
+        run_spike(args.num_aps, args.interval, args.target_ap, args.spike_util)
 
 
 if __name__ == "__main__":
