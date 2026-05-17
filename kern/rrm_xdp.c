@@ -251,8 +251,9 @@ int rrm_xdp_parser(struct xdp_md *ctx)
     __u8 event_type  = 0;
     __u8 new_consec  = 0;   /* consecutive high-util counter for updated state */
 
-    if (cap->event_flags & CAPWAP_EVENT_RADAR) {
-        /* DFS: flag-driven, no consecutive requirement */
+    if ((cap->event_flags & CAPWAP_EVENT_RADAR) && (cap->channel >= 52 && cap->channel <= 144)) {
+        /* DFS: flag-driven, no consecutive requirement. 
+         * Must only occur on valid 5GHz DFS channels (52-144). */
         emit_event = 1;
         event_type = RRM_EVENT_DFS;
         new_consec  = 0;   /* reset load counter on channel event */

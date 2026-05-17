@@ -46,8 +46,9 @@ CAPWAP_EVENT_NONE  = 0x00
 CAPWAP_EVENT_RADAR = 0x01
 
 # Channel sets
-CHANNELS_2G = [1, 6, 11]
-CHANNELS_5G = [36, 40, 44, 48, 52, 56, 60, 64, 149, 153, 157, 161]
+CHANNELS_2G         = [1, 6, 11]
+CHANNELS_5G_NON_DFS = [36, 40, 44, 48, 149, 153, 157, 161]
+CHANNELS_5G_DFS     = [52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140]
 
 # Struct format: matches struct capwap_lite_hdr exactly
 # ! = big-endian (network byte order)
@@ -136,8 +137,10 @@ class SimulatedAP:
 
 
 def make_aps(num_aps):
-    all_channels = CHANNELS_2G + CHANNELS_5G
-    return [SimulatedAP(i + 1, all_channels[i % len(all_channels)])
+    # Mix channels: 2.4GHz, 5GHz non-DFS, and 5GHz DFS to ensure variety
+    # even for small numbers of APs.
+    mixed_channels = [1, 36, 52, 6, 149, 60, 11, 40, 100, 44]
+    return [SimulatedAP(i + 1, mixed_channels[i % len(mixed_channels)])
             for i in range(num_aps)]
 
 
@@ -191,6 +194,14 @@ def run_dfs(num_aps, interval, target_ap_id, delay):
     print(f"[*] Radar event on AP{target_ap_id:03d} in {delay}s")
     src_mac, dst_mac = get_macs()
     aps       = make_aps(num_aps)
+    
+    # Enforce DFS channel for the target AP
+    target = next((ap for ap in aps if ap.ap_id == target_ap_id), None)
+    if target and target.channel not in CHANNELS_5G_DFS:
+        print(f"[!] Warning: AP{target_ap_id:03d} is on channel {target.channel}, which is not a DFS channel.", file=sys.stderr)
+        print(f"[*] Overriding AP{target_ap_id:03d} channel to 52 for realistic DFS simulation.", file=sys.stderr)
+        target.channel = 52
+
     tick      = 0
     radar_sent = False
     start_time = time.monotonic()
