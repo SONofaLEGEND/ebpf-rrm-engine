@@ -1,15 +1,7 @@
-// agent/fastloop.go
+// Package main implements the Go Agent.
 //
-// Fast-loop goroutine: reads classified events from the BPF ring buffer
-// and feeds them into the Store.
-//
-// This is the Near-RT RIC analog from the P4+RRM article:
-//   - Woken by the kernel immediately when the XDP program writes an event
-//   - No polling — ringbuf.Reader.Read() blocks until data is available
-//   - Target reaction time: sub-millisecond from kernel write to Store update
-//
-// The goroutine signals completion via the done channel so main() can
-// wait for clean shutdown after rd.Close() is called.
+// agent/fastloop.go runs the goroutine that consumes events from the eBPF ring buffer
+// and stores them in the state store.
 
 package main
 
@@ -21,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 )
 
 // RunFastLoop is the ring buffer consumer goroutine.
@@ -70,12 +63,12 @@ func RunFastLoop(
 			continue
 		}
 
-		// Compute kernel → userspace latency.
-		// evt.TimestampNs = bpf_ktime_get_ns() = ns since boot.
-		// bootTimeNs = boot time as Unix ns.
-		// kernelUnixNs = boot + offset = absolute Unix timestamp of the event.
-		kernelUnixNs := int64(bootTimeNs) + int64(evt.TimestampNs)
-		latencyNs := receivedAt.UnixNano() - kernelUnixNs
+		// Compute kernel → userspace latency using CLOCK_MONOTONIC to avoid
+		// coarse btime (procfs) drift/integer seconds errors.
+		latencyNs := int64(GetMonotonicTimeNs()) - int64(evt.TimestampNs)
+		if latencyNs < 0 {
+			latencyNs = 0 // Safeguard against tiny timing anomalies
+		}
 
 		rec := EventRecord{
 			ReceivedAt: receivedAt,
@@ -88,9 +81,20 @@ func RunFastLoop(
 		// Update shared state (thread-safe)
 		store.AddEvent(rec)
 
+		// Record Non-Occupancy Period (NOP) if radar was detected on a DFS channel
+		if evt.EventType == EventDFS {
+			store.AddNOPChannel(evt.Channel)
+		}
+
 		// Update Prometheus metrics (thread-safe)
 		if metrics != nil {
 			metrics.ObserveEvent(rec)
 		}
 	}
+}
+
+func GetMonotonicTimeNs() uint64 {
+	var tv unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &tv)
+	return uint64(tv.Sec)*1e9 + uint64(tv.Nsec)
 }

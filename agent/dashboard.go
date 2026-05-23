@@ -1,24 +1,6 @@
-// agent/dashboard.go
+// Package main implements the Go Agent.
 //
-// Terminal UI dashboard using rivo/tview.
-//
-// Layout:
-//   ┌────────────────────────────────┬──────────────────────────────────┐
-//   │  AP State Table (slow-loop)    │  Event Log (fast-loop)           │
-//   │  AP | CH | RAW | EWMA | ...   │  14:23:15 AP2 DFS ch6 847µs     │
-//   │   1 |  1 |  38 |  36  | ...   │  14:23:31 AP3 LOAD ch11 1.2ms   │
-//   │  ...                          │  ...                             │
-//   ├────────────────────────────────┴──────────────────────────────────┤
-//   │  Status: APs:5 | Events:7 | Avg latency:1.2µs | Uptime:00:02:34 │
-//   └───────────────────────────────────────────────────────────────────┘
-//
-// tview threading rule: ALL mutations to tview widgets must happen either:
-//   a) in the main tview goroutine (via app.QueueUpdateDraw), or
-//   b) from within a tview event handler.
-//
-// The slow-loop and fast-loop goroutines update tview via app.QueueUpdateDraw,
-// which queues a function for execution on the tview goroutine.
-// This is the ONLY safe way to update tview from external goroutines.
+// agent/dashboard.go provides the terminal-based UI using rivo/tview.
 
 package main
 
@@ -247,6 +229,9 @@ func (d *Dashboard) updateEventLog() {
 		case EventNoiseSpike:
 			typeTag = "[cyan]"
 			typePad = "NOISE_SPIKE "
+		case EventRegViolation:
+			typeTag = "[purple]"
+			typePad = "REG_VIOLATION"
 		default:
 			typeTag = "[white]"
 			typePad = fmt.Sprintf("TYPE(%d)    ", rec.Event.EventType)

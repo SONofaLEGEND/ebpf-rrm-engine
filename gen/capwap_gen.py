@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-gen/capwap_gen.py — Phase 2: all three traffic modes
+gen/capwap_gen.py — CAPWAP-lite traffic generator
 
 Modes:
-  --mode normal   steady-state telemetry (Phase 1, unchanged)
+  --mode normal   steady-state telemetry
   --mode dfs      injects a radar detection event on one AP after a delay
   --mode spike    ramps channel_util of one AP to trigger load anomaly detection
 
 Run as: sudo python3 gen/capwap_gen.py --mode [normal|dfs|spike] [options]
-
-Phase 2 milestone tests:
-  DFS:   sudo python3 gen/capwap_gen.py --mode dfs --target-ap 2 --delay 5
-         → After 5s: AP2 emits one packet with CAPWAP_EVENT_RADAR set.
-         → Go agent should print a DFS event within 1 packet interval.
-
-  Spike: sudo python3 gen/capwap_gen.py --mode spike --target-ap 3 --spike-util 92
-         → AP3 util ramps from baseline to 92% over 10 packets.
-         → Go agent should print a LOAD_ANOMALY event after 3 consecutive
-           packets above the 85% threshold.
 """
 
 import sys
@@ -48,7 +38,7 @@ CAPWAP_EVENT_RADAR = 0x01
 # Channel sets
 CHANNELS_2G         = [1, 6, 11]
 CHANNELS_5G_NON_DFS = [36, 40, 44, 48, 149, 153, 157, 161]
-CHANNELS_5G_DFS     = [52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140]
+CHANNELS_5G_DFS     = [52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144]
 
 # Struct format: matches struct capwap_lite_hdr exactly
 # ! = big-endian (network byte order)
@@ -147,7 +137,7 @@ def make_aps(num_aps):
 # ── Mode: normal ───────────────────────────────────────────────────────────────
 
 def run_normal(num_aps, interval):
-    """Steady-state periodic telemetry for all APs. Unchanged from Phase 1."""
+    """Steady-state periodic telemetry for all APs."""
     print(f"[*] Mode: normal | APs: {num_aps} | interval: {interval}s")
     src_mac, dst_mac = get_macs()
     aps  = make_aps(num_aps)
@@ -184,7 +174,7 @@ def run_dfs(num_aps, interval, target_ap_id, delay):
     single CAPWAP radar notification, not a sustained flag.
 
     Expected Go agent output:
-        [EVENT] DFS       AP:002 ch:6 util:43% noise:-82dBm
+        [EVENT] DFS       AP:003 ch:52 util:43% noise:-82dBm
     """
     if target_ap_id < 1 or target_ap_id > num_aps:
         print(f"[!] --target-ap must be 1–{num_aps}", file=sys.stderr)
@@ -360,7 +350,7 @@ def run_spike(num_aps, interval, target_ap_id, spike_util):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CAPWAP-lite generator — ebpf-rrm-engine Phase 2",
+        description="CAPWAP-lite generator — ebpf-rrm-engine",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--mode", choices=["normal", "dfs", "spike"],

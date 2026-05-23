@@ -1,11 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# ebpf-rrm-engine/Makefile — Phase 3
-#
-# Changes from Phase 2:
-#   make run           → launches full TUI dashboard
-#   make run-headless  → no TUI, prints to stdout (useful over SSH)
-#   make ctl-*         → control CLI shortcuts
-#   make metrics       → curl the Prometheus endpoint
+# ebpf-rrm-engine/Makefile
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARCH := $(shell uname -m)
@@ -29,16 +23,18 @@ AGENT_DIR := ./agent
 
 INCLUDES := -I./kern -I./proto -I$(LINUX_INC)
 
+# Production CFLAGS: -O2 (required for eBPF), -g (BTF debug info for CO-RE)
+# -DNDEBUG removes any remaining debug assertions
 CFLAGS := \
-    -O2 -g -Wall \
+    -O2 -g -Wall -DNDEBUG \
     -target bpf \
     -D__TARGET_ARCH_$(BPF_ARCH) \
     $(INCLUDES)
 
 .PHONY: all vmlinux agent run run-headless load unload verify maps \
         gen-normal gen-dfs gen-spike \
-        ctl-get-state ctl-get-thresholds ctl-set-threshold \
-        metrics clean help
+        ctl-get-state ctl-get-thresholds ctl-set-threshold ctl-get-stats \
+        metrics benchmark install-deps clean help
 
 all: $(KERN_OBJ) agent
 
@@ -47,12 +43,15 @@ all: $(KERN_OBJ) agent
 $(KERN_OBJ): $(KERN_SRC) kern/vmlinux.h kern/rrm_maps.h proto/capwap_lite.h
 	@echo "[*] Compiling $(KERN_SRC) → $(KERN_OBJ) (arch=$(BPF_ARCH))"
 	$(CLANG) $(CFLAGS) -c $< -o $@
-	@echo "[+] BPF object compiled"
-	@readelf -S $@ | grep -E 'xdp|maps|license|BTF' || true
+	@echo "[+] Compiled"
+	@echo "[*] Checking BTF:"
+	@readelf -S $@ | grep -q BTF && echo "[+] BTF present" || echo "[!] BTF missing"
+	@echo "[*] Sections:"
+	@readelf -S $@ | grep -E 'xdp|maps|license' | awk '{print "    " $$0}'
 
 vmlinux:
 	@test -f /sys/kernel/btf/vmlinux || \
-	    (echo "[!] /sys/kernel/btf/vmlinux missing" && exit 1)
+	    (echo "[!] /sys/kernel/btf/vmlinux missing — BTF not enabled?" && exit 1)
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > kern/vmlinux.h
 	@echo "[+] Generated kern/vmlinux.h ($$(wc -l < kern/vmlinux.h) lines)"
 
@@ -60,50 +59,44 @@ vmlinux:
 
 agent:
 	@echo "[*] Building Go agent..."
-	cd $(AGENT_DIR) && $(GO) mod tidy && $(GO) build -o ../$(AGENT_BIN) .
-	@echo "[+] Built ./$(AGENT_BIN)"
+	cd $(AGENT_DIR) && $(GO) mod tidy && $(GO) build -ldflags="-s -w" -o ../$(AGENT_BIN) .
+	@echo "[+] Built ./$(AGENT_BIN) ($$(du -sh $(AGENT_BIN) | cut -f1))"
 
-# Full TUI dashboard mode (default)
+# -ldflags="-s -w": strip debug symbols from the binary (smaller, faster to start)
+
 run: all
-	@echo "[*] Starting agent with TUI dashboard (press 'q' to quit)..."
 	sudo ./$(AGENT_BIN) --iface veth0
 
-# Headless mode — useful over SSH or for scripted testing
 run-headless: all
-	@echo "[*] Starting agent in headless mode..."
 	sudo ./$(AGENT_BIN) --iface veth0 --no-dashboard
 
-# ── Standalone XDP load ───────────────────────────────────────────────────────
-# For testing the XDP program without the Go agent
+# ── Standalone XDP ────────────────────────────────────────────────────────────
 
 load: $(KERN_OBJ)
 	sudo ip link set dev veth0 xdpgeneric obj $(KERN_OBJ) sec xdp
-	@echo "[+] XDP loaded"
+	@echo "[+] XDP loaded on veth0"
 
 unload:
 	-sudo ip link set dev veth0 xdpgeneric off
 	@echo "[+] Detached"
 
-# ── BPF inspection ────────────────────────────────────────────────────────────
+# ── Inspection ────────────────────────────────────────────────────────────────
 
 verify:
 	@sudo $(BPFTOOL) prog show
 	@echo ""
 	@sudo $(BPFTOOL) map show
 
+# Instruction count check — production target: < 200
+insn-count:
+	@echo "[*] Verifier instruction count for rrm_xdp_parser:"
+	@sudo $(BPFTOOL) prog show name rrm_xdp_parser 2>/dev/null \
+	    | grep insns_cnt || echo "(load the program first: make load)"
+
 maps:
 	@sudo bash scripts/read_maps.sh
 
-# ── Prometheus metrics ────────────────────────────────────────────────────────
-# Run while agent is running in another terminal
-
-metrics:
-	@echo "[*] Fetching metrics from http://localhost:9090/metrics"
-	@curl -s http://localhost:9090/metrics | grep -E '^rrm_' | head -40 || \
-	    echo "[!] Agent not running or metrics not available"
-
-# ── Traffic generator shortcuts ───────────────────────────────────────────────
-# Run in a separate terminal while agent is running
+# ── Traffic generator ─────────────────────────────────────────────────────────
 
 gen-normal:
 	sudo python3 gen/capwap_gen.py --mode normal --num-aps 5 --interval 1.0
@@ -114,8 +107,7 @@ gen-dfs:
 gen-spike:
 	sudo python3 gen/capwap_gen.py --mode spike --num-aps 5 --target-ap 3 --spike-util 92
 
-# ── Control CLI shortcuts ─────────────────────────────────────────────────────
-# Requires agent to be running (it must have loaded the BPF object)
+# ── Control CLI ───────────────────────────────────────────────────────────────
 
 ctl-get-state:
 	sudo ./$(AGENT_BIN) ctl get-state
@@ -123,29 +115,90 @@ ctl-get-state:
 ctl-get-thresholds:
 	sudo ./$(AGENT_BIN) ctl get-thresholds
 
-# Usage: make ctl-set-threshold ARGS="--util-high 75 --util-consec 2"
+# make ctl-set-threshold ARGS="--util-high 70 --util-consec 2"
 ctl-set-threshold:
 	sudo ./$(AGENT_BIN) ctl set-threshold $(ARGS)
+
+ctl-get-stats:
+	sudo ./$(AGENT_BIN) ctl get-stats
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+metrics:
+	@curl -s http://localhost:9090/metrics | grep -E '^rrm_' | head -50 || \
+	    echo "[!] Agent not running"
+
+# ── Benchmark ─────────────────────────────────────────────────────────────────
+
+benchmark: all
+	@chmod +x scripts/benchmark.sh
+	sudo bash scripts/benchmark.sh
+
+# ── Cleaned ───────────────────────────────────────────────────────────────────
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
+install-deps:
+	@echo "[*] Installing system dependencies..."
+	sudo apt update
+	sudo apt install -y build-essential git curl wget pkg-config \
+	    libbpf-dev libelf-dev zlib1g-dev \
+	    linux-tools-common linux-tools-generic \
+	    python3 python3-pip
+	@echo "[*] Installing Scapy..."
+	sudo pip3 install scapy
+	@echo "[*] Installing clang-17 (if not present)..."
+	@command -v clang-17 >/dev/null 2>&1 || \
+	    (wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && \
+	     sudo ./llvm.sh 17 && rm llvm.sh && \
+	     sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 100)
+	@echo "[+] System dependencies installed"
+	@echo "[*] Install Go manually: see official Go installation guide"
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
 clean:
-	@rm -f $(KERN_OBJ) $(AGENT_BIN)
+	@rm -f $(KERN_OBJ) $(AGENT_BIN) benchmark_results.txt
 	@echo "[+] Cleaned"
 
+# Unpin BPF maps from filesystem (if agent crashed without cleanup)
+unpin:
+	-sudo rm -rf /sys/fs/bpf/rrm
+	@echo "[+] BPF maps unpinned"
+
 help:
-	@echo "Phase 3 targets:"
-	@echo "  make vmlinux          generate kern/vmlinux.h (once)"
-	@echo "  make                  compile BPF + build Go agent"
-	@echo "  make run              sudo: TUI dashboard mode"
-	@echo "  make run-headless     sudo: headless / SSH mode"
-	@echo "  make gen-normal       run traffic generator (normal)"
-	@echo "  make gen-dfs          run traffic generator (DFS event)"
-	@echo "  make gen-spike        run traffic generator (load spike)"
-	@echo "  make metrics          curl Prometheus metrics endpoint"
-	@echo "  make ctl-get-state    print AP state from BPF map"
-	@echo "  make ctl-get-thresholds print threshold config"
-	@echo "  make ctl-set-threshold ARGS='--util-high 75'  update thresholds live"
-	@echo "  make verify           show loaded programs + maps"
-	@echo "  make maps             pretty-print BPF map contents"
-	@echo "  make clean            remove build artifacts"
+	@echo ""
+	@echo "ebpf-rrm-engine — Makefile"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make install-deps     Install system dependencies (Ubuntu)"
+	@echo "  make vmlinux          Generate kern/vmlinux.h (run once)"
+	@echo ""
+	@echo "Build:"
+	@echo "  make                  Compile BPF + build Go agent"
+	@echo ""
+	@echo "Run:"
+	@echo "  make run              sudo: TUI dashboard"
+	@echo "  make run-headless     sudo: headless mode"
+	@echo ""
+	@echo "Traffic:"
+	@echo "  make gen-normal       Normal steady-state telemetry"
+	@echo "  make gen-dfs          DFS radar injection (fires after 5s)"
+	@echo "  make gen-spike        Load anomaly ramp"
+	@echo ""
+	@echo "Control CLI (agent must be running):"
+	@echo "  make ctl-get-state             Print AP state"
+	@echo "  make ctl-get-thresholds        Print thresholds"
+	@echo "  make ctl-set-threshold ARGS='' Update thresholds live"
+	@echo "  make ctl-get-stats             Print drop counter"
+	@echo ""
+	@echo "Metrics:"
+	@echo "  make metrics          curl /metrics"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make benchmark        Run automated benchmark suite"
+	@echo "  make insn-count       Check XDP instruction count"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "  make clean            Remove build artifacts"
+	@echo "  make unpin            Remove /sys/fs/bpf/rrm/ (after crash)"

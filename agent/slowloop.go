@@ -1,15 +1,7 @@
-// agent/slowloop.go
+// Package main implements the Go Agent.
 //
-// Slow-loop goroutine: polls the ap_state and ap_pkt_count BPF maps
-// on a configurable interval and updates the Store's AP snapshots.
-//
-// This is the "controller polling cycle" analog — demonstrating the
-// deliberate architectural difference from the fast-loop:
-//   Fast-loop: event-driven, sub-millisecond reaction via ring buffer
-//   Slow-loop: periodic, poll-based, interval-bounded visibility
-//
-// The contrast between these two loops is the central argument of the
-// P4+RRM article. Both are observable in the TUI dashboard simultaneously.
+// agent/slowloop.go runs the goroutine that periodically polls the eBPF maps
+// to snapshot AP telemetry and check for regulatory compliance.
 
 package main
 
@@ -26,13 +18,15 @@ import (
 //
 //	apStateMap   — ap_state HASH map (key: ap_id, value: APInfo)
 //	pktCountMap  — ap_pkt_count HASH map (key: ap_id, value: uint64)
+//	statsMap     — global stats ARRAY map
 //	store        — shared state store
 //	metrics      — Prometheus metrics (nil disables metric export)
-//	interval     — poll interval (default: 500ms)
+//	interval     — poll interval
 //	stop         — close to stop the goroutine
 func RunSlowLoop(
 	apStateMap *ebpf.Map,
 	pktCountMap *ebpf.Map,
+	statsMap *ebpf.Map,
 	store *Store,
 	metrics *Metrics,
 	interval time.Duration,
@@ -46,7 +40,7 @@ func RunSlowLoop(
 		case <-stop:
 			return
 		case <-ticker.C:
-			pollMaps(apStateMap, pktCountMap, store, metrics)
+			pollMaps(apStateMap, pktCountMap, statsMap, store, metrics)
 		}
 	}
 }
@@ -56,14 +50,13 @@ func RunSlowLoop(
 func pollMaps(
 	apStateMap *ebpf.Map,
 	pktCountMap *ebpf.Map,
+	statsMap *ebpf.Map,
 	store *Store,
 	metrics *Metrics,
 ) {
 	now := time.Now()
 
 	// Iterate over all ap_state entries.
-	// ebpf.Map.Iterate() returns an iterator that calls the kernel
-	// bpf_map_get_next_key + bpf_map_lookup_elem pair internally.
 	var apID uint32
 	var info APInfo
 
@@ -72,7 +65,6 @@ func pollMaps(
 		// Look up the packet count for this AP.
 		var pktCount uint64
 		if err := pktCountMap.Lookup(apID, &pktCount); err != nil {
-			// AP may not yet have a packet count entry (race with init).
 			pktCount = 0
 		}
 
@@ -84,6 +76,15 @@ func pollMaps(
 		}
 		store.UpdateAPSnapshot(snap)
 
+		// Check for DFS regulatory compliance violations
+		if store.IsChannelInNOP(info.Channel) {
+			store.IncrementViolations()
+			log.Printf("[slow-loop] [REGULATORY VIOLATION] AP %d is active on DFS channel %d during active NOP!", apID, info.Channel)
+			if metrics != nil {
+				metrics.IncRegulatoryViolations()
+			}
+		}
+
 		// Push per-AP gauge metrics to Prometheus.
 		if metrics != nil {
 			metrics.UpdateAPGauges(snap)
@@ -92,5 +93,9 @@ func pollMaps(
 
 	if err := iter.Err(); err != nil {
 		log.Printf("[slow-loop] ap_state iterate error: %v", err)
+	}
+
+	if metrics != nil && statsMap != nil {
+		metrics.UpdateGlobalStats(statsMap)
 	}
 }

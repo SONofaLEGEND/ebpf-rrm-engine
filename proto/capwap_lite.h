@@ -36,7 +36,7 @@
 
 /* event_flags bit definitions */
 #define CAPWAP_EVENT_RADAR     (1 << 0)   /* DFS radar detected on channel */
-#define CAPWAP_EVENT_RESERVED  (1 << 1)   /* reserved for Phase 2 */
+#define CAPWAP_EVENT_RESERVED  (1 << 1)   /* reserved for future use */
 
 /*
  * capwap_lite_hdr — on-wire header structure.

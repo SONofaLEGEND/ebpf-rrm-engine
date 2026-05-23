@@ -32,16 +32,19 @@ type Store struct {
 	events         []EventRecord
 	maxEvents      int
 	apSnapshots    map[uint32]APSnapshot
-	eventCounts    [3]uint64
+	eventCounts    [4]uint64
 	totalLatencyNs int64
 	latencyCount   int64
 	startTime      time.Time
+	nopChannels    map[uint8]time.Time
+	violations     uint64
 }
 
 func NewStore(maxEvents int) *Store {
 	return &Store{
 		maxEvents:   maxEvents,
 		apSnapshots: make(map[uint32]APSnapshot),
+		nopChannels: make(map[uint8]time.Time),
 		startTime:   time.Now(),
 	}
 }
@@ -74,7 +77,7 @@ func (s *Store) Events() []EventRecord {
 	return out
 }
 
-func (s *Store) EventCounts() [3]uint64 {
+func (s *Store) EventCounts() [4]uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.eventCounts
@@ -118,6 +121,57 @@ func (s *Store) APCount() int {
 	return len(s.apSnapshots)
 }
 
+// AddNOPChannel registers a DFS channel in Non-Occupancy Period for 30 minutes.
+func (s *Store) AddNOPChannel(channel uint8) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nopChannels[channel] = time.Now().Add(30 * time.Minute)
+}
+
+// IsChannelInNOP checks if a channel is currently in its 30-minute NOP window.
+// It also cleans up expired NOP entries.
+func (s *Store) IsChannelInNOP(channel uint8) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, exists := s.nopChannels[channel]
+	if !exists {
+		return false
+	}
+	if time.Now().After(expiry) {
+		delete(s.nopChannels, channel)
+		return false
+	}
+	return true
+}
+
+// ActiveNOPChannels returns a copy of currently active NOP channels.
+func (s *Store) ActiveNOPChannels() map[uint8]time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[uint8]time.Time)
+	now := time.Now()
+	for ch, expiry := range s.nopChannels {
+		if expiry.After(now) {
+			out[ch] = expiry
+		}
+	}
+	return out
+}
+
+// IncrementViolations increments the regulatory violations count.
+func (s *Store) IncrementViolations() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.violations++
+}
+
+// Violations returns the number of detected regulatory violations.
+func (s *Store) Violations() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.violations
+}
+
 func (s *Store) Summary() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -132,9 +186,10 @@ func (s *Store) Summary() string {
 	m := int(uptime.Minutes()) % 60
 	sec := int(uptime.Seconds()) % 60
 	return fmt.Sprintf(
-		" APs: %d  |  Events: %d (DFS:%d LOAD:%d NOISE:%d)  |  Avg latency: %.1fµs  |  Uptime: %02d:%02d:%02d ",
+		" APs: %d  |  Events: %d (DFS:%d LOAD:%d NOISE:%d)  |  Violations: %d  |  Avg latency: %.1fµs  |  Uptime: %02d:%02d:%02d ",
 		len(s.apSnapshots), total,
 		counts[EventDFS], counts[EventLoadAnomaly], counts[EventNoiseSpike],
+		s.violations,
 		avgUs, h, m, sec,
 	)
 }
